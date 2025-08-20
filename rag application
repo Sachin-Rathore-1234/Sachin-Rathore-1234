@@ -1,0 +1,216 @@
+!pip install groq langchain chromadb faiss-cpu flask fastapi uvicorn pypdf
+
+import os
+os.environ["GROQ_API_KEY"] = "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"
+
+!pip install PyPDF2
+
+import os
+from PyPDF2 import PdfReader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from google.colab import files
+
+
+uploaded = files.upload()  
+pdf_files = list(uploaded.keys())
+
+all_text = ""
+for pdf in pdf_files:
+    reader = PdfReader(pdf)
+    for page in reader.pages:
+        all_text += page.extract_text() + "\n"
+
+print("Extracted text length:", len(all_text))
+
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,  
+    chunk_overlap=200,
+    length_function=len
+)
+
+chunks = text_splitter.split_text(all_text)
+
+print(f" Total Chunks Created: {len(chunks)}")
+print("Sample chunk:\n", chunks[0][:500])
+
+
+!pip install -U langchain-community sentence-transformers
+
+import re
+
+
+clean_chunks = []
+for c in chunks:
+    if isinstance(c, str):
+        text = re.sub(r'[^a-zA-Z0-9\s.,!?;:()\-\']+', ' ', c)  
+        clean_chunks.append(text.strip())
+
+print("Cleaned Chunks:", len(clean_chunks))
+
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+
+embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-MiniLM-L3-v2")
+
+
+persist_directory = "chroma_db"
+
+vectordb = Chroma.from_texts(
+    texts=clean_chunks,
+    embedding=embedding_model,
+    persist_directory=persist_directory
+)
+
+vectordb.persist()
+print("ChromaDB created and embeddings stored with", len(clean_chunks), "chunks")
+from groq import Groq
+
+client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+def ask_question(query, k=3):
+    """
+    query: user question
+    k: number of top chunks to retrieve
+    """
+
+    docs = vectordb.similarity_search(query, k=k)
+    context = "\n\n".join([d.page_content for d in docs])
+
+
+    prompt = f"""
+    You are an AI assistant. Use the following context from documents to answer the question.
+
+    Context:
+    {context}
+
+    Question: {query}
+
+    Answer:
+    """
+
+    chat_completion = client.chat.completions.create(
+        messages=[{"role": "user", "content": prompt}],
+        model="llama-3.1-8b-instant",
+    )
+
+    return chat_completion.choices[0].message.content
+
+
+
+question = "What is ?"
+answer = ask_question(question)
+print("Q:", question)
+print("A:", answer)
+
+
+                           code = """
+import os
+import re
+from fastapi import FastAPI, UploadFile, Form
+from fastapi.responses import JSONResponse
+from PyPDF2 import PdfReader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from groq import Groq
+import shutil
+
+app = FastAPI()
+persist_directory = "chroma_db"
+
+# Embeddings
+embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-MiniLM-L3-v2")
+
+# Vector DB (reload if exists)
+vectordb = Chroma(persist_directory=persist_directory, embedding_function=embedding_model)
+
+# Groq client
+client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+def process_pdf(pdf_path):
+    reader = PdfReader(pdf_path)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() + "\\n"
+
+    text = re.sub(r'[^a-zA-Z0-9\\s.,!?;:()\\-\\']+', ' ', text)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    return splitter.split_text(text)
+
+@app.post("/upload")
+async def upload(file: UploadFile):
+    path = f"temp_{file.filename}"
+    with open(path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    chunks = process_pdf(path)
+    vectordb.add_texts(chunks)
+    vectordb.persist()
+    return {"status": "success", "chunks_added": len(chunks)}
+
+@app.post("/query")
+async def query(question: str = Form(...)):
+    docs = vectordb.similarity_search(question, k=3)
+    context = "\\n\\n".join([d.page_content for d in docs])
+
+    prompt = f\"\"\"Use the following context from documents to answer:
+
+    Context:
+    {context}
+
+    Question: {question}
+
+    Answer:
+    \"\"\"
+
+    chat_completion = client.chat.completions.create(
+        messages=[{"role": "user", "content": prompt}],
+        model="llama-3.1-8b-instant",
+    )
+    return {"question": question, "answer": chat_completion.choices[0].message.content}
+
+@app.get("/metadata")
+async def metadata():
+    return {"documents": vectordb._collection.count()}
+"""
+
+with open("main.py", "w") as f:
+    f.write(code)
+
+print("main.py created successfully")
+
+
+
+                           import gradio as gr
+
+def rag_query(question):
+    docs = vectordb.similarity_search(question, k=3)
+    context = "\n\n".join([d.page_content for d in docs])
+    prompt = f"""
+    Use the following context from documents to answer:
+
+    Context:
+    {context}
+
+    Question: {question}
+
+    Answer:
+    """
+    chat_completion = client.chat.completions.create(
+        messages=[{"role": "user", "content": prompt}],
+        model="llama-3.1-8b-instant",
+    )
+    return chat_completion.choices[0].message.content
+
+
+demo = gr.Interface(
+    fn=rag_query,
+    inputs=gr.Textbox(label="Ask a question about your PDFs"),
+    outputs="text",
+    title=" RAG with Groq API",
+    description="Upload your PDFs first, then ask questions!"
+)
+
+demo.launch(share=True)
